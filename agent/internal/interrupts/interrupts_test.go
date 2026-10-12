@@ -28,6 +28,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/NVIDIA/nodewright/agent/internal/command"
 	"github.com/NVIDIA/nodewright/agent/internal/execution"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -123,15 +124,35 @@ var _ = Describe("Encode/Decode", func() {
 	})
 })
 
-func newInterruptRunConfig() execution.Config {
-	config, err := execution.NewConfig(
+func newInterruptRunConfig(options ...execution.Option) execution.Config {
+	defaults := []execution.Option{
 		execution.WithRootMount("/host"),
 		execution.WithStepRoot("/steps"),
 		execution.WithSkyhookDir("/package"),
 		execution.WithRunOutput(io.Discard, io.Discard),
-	)
+	}
+	config, err := execution.NewConfig(append(defaults, options...)...)
 	Expect(err).NotTo(HaveOccurred())
 	return config
+}
+
+func withInterruptRunner(runner command.Runner) execution.Option {
+	return execution.WithRunnerFactory(func(options ...command.RunnerOption) command.Runner {
+		Expect(command.NewRunner(options...)).To(Equal(command.NewRunner(command.WithChroot("/host"))))
+		return runner
+	})
+}
+
+func interruptCommand(config execution.Config, executable string, arguments ...string) command.Command {
+	if arguments == nil {
+		arguments = []string{}
+	}
+	return command.NewCommand(executable,
+		command.WithArguments(arguments...),
+		command.WithWorkingDirectory(config.SkyhookDir()),
+		command.WithStdout(config.Stdout()),
+		command.WithStderr(config.Stderr()),
+	)
 }
 
 func runInterruptTestHelper() bool {

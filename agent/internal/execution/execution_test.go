@@ -23,6 +23,8 @@ import (
 	"io"
 	"testing"
 
+	"github.com/NVIDIA/nodewright/agent/internal/command"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -87,5 +89,29 @@ var _ = Describe("Status", func() {
 	It("uses stable success and failure values", func() {
 		Expect(StatusSuccess).To(Equal(Status("success")))
 		Expect(StatusFailed).To(Equal(Status("failed")))
+	})
+})
+
+var _ = Describe("runner construction", func() {
+	It("defaults to the command package factory, including for a nil factory", func() {
+		config, err := NewConfig(WithRootMount("/host"), WithStepRoot("/steps"), WithSkyhookDir("/package"), WithRunnerFactory(nil))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(config.NewRunner()).To(Equal(command.NewRunner()))
+		Expect(config.NewRunner(command.WithChroot("/host"))).To(Equal(command.NewRunner(command.WithChroot("/host"))))
+	})
+
+	It("forwards runner options to the configured factory", func() {
+		calls := 0
+		expected := command.NewRunner()
+		config, err := NewConfig(WithRootMount("/host"), WithStepRoot("/steps"), WithSkyhookDir("/package"),
+			WithRunnerFactory(func(options ...command.RunnerOption) command.Runner {
+				calls++
+				Expect(command.NewRunner(options...)).To(Equal(command.NewRunner(command.WithChroot("/custom"))))
+				return expected
+			}),
+		)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(config.NewRunner(command.WithChroot("/custom"))).To(BeIdenticalTo(expected))
+		Expect(calls).To(Equal(1))
 	})
 })

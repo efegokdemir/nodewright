@@ -30,6 +30,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/NVIDIA/nodewright/agent/internal/command"
 	"github.com/NVIDIA/nodewright/agent/internal/execution"
 	"github.com/NVIDIA/nodewright/agent/internal/flags"
 	"github.com/NVIDIA/nodewright/agent/internal/history"
@@ -80,6 +81,7 @@ type runtimeConfig struct {
 	stdout        io.Writer
 	stderr        io.Writer
 	logger        *slog.Logger
+	runnerFactory func(...command.RunnerOption) command.Runner
 }
 
 type unsupportedStageError struct {

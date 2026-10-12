@@ -218,11 +218,11 @@ func runStep(
 		)
 	}
 
-	runner := command.NewRunner(command.WithChroot(config.RootMount()))
+	runner := config.NewRunner(command.WithChroot(config.RootMount()))
 	stepRoot := config.StepRoot()
 	skyhookDir := config.SkyhookDir()
 	if !onHost {
-		runner = command.NewRunner()
+		runner = config.NewRunner()
 		mountedStepRoot, err := hostfs.HostPathToMounted(config.RootMount(), stepRoot)
 		if err != nil {
 			return execution.StatusFailed, fmt.Errorf(

@@ -131,6 +131,7 @@ func runInterrupt(
 		execution.WithStepRoot(flags.StepsDir(req.copyDir)),
 		execution.WithSkyhookDir(req.copyDir),
 		execution.WithRunOutput(operationLog.stdout, operationLog.stderr),
+		execution.WithRunnerFactory(runtime.runnerFactory),
 	)
 	if err != nil {
 		return execution.StatusFailed, errors.Join(

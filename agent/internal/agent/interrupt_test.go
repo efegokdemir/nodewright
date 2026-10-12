@@ -25,7 +25,10 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"syscall"
 
+	"github.com/NVIDIA/nodewright/agent/internal/command"
+	commandmock "github.com/NVIDIA/nodewright/agent/internal/command/mock"
 	"github.com/NVIDIA/nodewright/agent/internal/config"
 	"github.com/NVIDIA/nodewright/agent/internal/execution"
 	"github.com/NVIDIA/nodewright/agent/internal/flags"
@@ -343,5 +346,232 @@ var _ = Describe("interrupt orchestration", func() {
 
 		Expect(err).NotTo(HaveOccurred())
 		Expect(status).To(Equal(execution.StatusSuccess))
+	})
+})
+
+var _ = Describe("concrete interrupt orchestration", func() {
+	var (
+		root    string
+		layout  flags.Layout
+		req     request
+		runtime runtimeConfig
+		runner  *commandmock.MockRunner
+		ctx     context.Context
+	)
+	BeforeEach(func() {
+		root = GinkgoT().TempDir()
+		layout = flags.DefaultLayout(root)
+		req = request{rootMount: root, copyDir: "/package"}
+		ctx = context.Background()
+		runner = commandmock.NewMockRunner(GinkgoT())
+		runtime = runtimeConfig{
+			resourceID: "resource_package_1.0.0",
+			stdout:     io.Discard, stderr: io.Discard,
+			logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+			runnerFactory: func(options ...command.RunnerOption) command.Runner {
+				Expect(command.NewRunner(options...)).To(Equal(command.NewRunner(command.WithChroot(root))))
+				return runner
+			},
+		}
+	})
+	writeBootID := func(id string) {
+		path := filepath.Join(root, hostBootIDPath)
+		Expect(os.MkdirAll(filepath.Dir(path), 0o755)).To(Succeed())
+		Expect(os.WriteFile(path, []byte(id+"\n"), 0o600)).To(Succeed())
+	}
+	expectedCommand := func(executable string, arguments ...string) command.Command {
+		if arguments == nil {
+			arguments = []string{}
+		}
+		return command.NewCommand(executable, command.WithArguments(arguments...),
+			command.WithWorkingDirectory(req.copyDir), command.WithStdout(runtime.stdout), command.WithStderr(runtime.stderr))
+	}
+
+	DescribeTable("keeps reboot pending until the boot ID changes",
+		func(result command.Result, runErr error, expected execution.Status) {
+			writeBootID("boot-a")
+			marker := interruptCompletionMarkers(layout, runtime.resourceID, interrupts.NodeRestart{})[0]
+			pending := filepath.Join(filepath.Dir(marker), "node_restart_0.pending")
+			runner.EXPECT().Run(ctx, expectedCommand("reboot")).Run(func(context.Context, command.Command) {
+				data, err := os.ReadFile(pending)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(string(data)).To(Equal("boot-id:boot-a\n"))
+				Expect(marker).NotTo(BeAnExistingFile())
+			}).Return(result, runErr).Twice()
+			for range 2 {
+				status, err := runInterrupt(ctx, req, runtime, layout, interrupts.NodeRestart{})
+				Expect(status).To(Equal(expected))
+				if runErr != nil {
+					Expect(errors.Is(err, runErr)).To(BeTrue())
+				} else {
+					Expect(err).NotTo(HaveOccurred())
+				}
+				Expect(pending).To(BeAnExistingFile())
+				Expect(marker).NotTo(BeAnExistingFile())
+			}
+			writeBootID("boot-b")
+			runtime.runnerFactory = func(...command.RunnerOption) command.Runner {
+				Fail("confirmed reboot constructed a runner")
+				return nil
+			}
+			for range 2 {
+				status, err := runInterrupt(ctx, req, runtime, layout, interrupts.NodeRestart{})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(status).To(Equal(execution.StatusSuccess))
+			}
+			Expect(pending).NotTo(BeAnExistingFile())
+			Expect(marker).To(BeAnExistingFile())
+		},
+		Entry("SIGTERM", command.Result{ExitCode: command.SignalExitCode, Signal: syscall.SIGTERM}, nil, execution.StatusSuccess),
+		Entry("SIGKILL", command.Result{ExitCode: command.SignalExitCode, Signal: syscall.SIGKILL}, nil, execution.StatusFailed),
+		Entry("runner error", command.Result{}, errors.New("reboot interrupted"), execution.StatusFailed),
+	)
+
+	It("honours a legacy Python node_restart_0.complete without reading the boot ID or running reboot", func() {
+		marker := interruptCompletionMarkers(layout, runtime.resourceID, interrupts.NodeRestart{})[0]
+		Expect(os.MkdirAll(filepath.Dir(marker), 0o755)).To(Succeed())
+		Expect(os.WriteFile(marker, []byte("legacy timestamp"), 0o600)).To(Succeed())
+		runtime.runnerFactory = func(...command.RunnerOption) command.Runner {
+			Fail("legacy completion constructed a runner")
+			return nil
+		}
+		status, err := runInterrupt(ctx, req, runtime, layout, interrupts.NodeRestart{})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(status).To(Equal(execution.StatusSuccess))
+		Expect(filepath.Join(root, hostBootIDPath)).NotTo(BeAnExistingFile())
+	})
+
+	DescribeTable("replaces malformed pending markers before running reboot",
+		func(contents string) {
+			writeBootID("boot-a")
+			marker := interruptCompletionMarkers(layout, runtime.resourceID, interrupts.NodeRestart{})[0]
+			pending := filepath.Join(filepath.Dir(marker), "node_restart_0.pending")
+			Expect(os.MkdirAll(filepath.Dir(pending), 0o755)).To(Succeed())
+			Expect(os.WriteFile(pending, []byte(contents), 0o600)).To(Succeed())
+			runner.EXPECT().Run(ctx, expectedCommand("reboot")).Run(func(context.Context, command.Command) {
+				data, err := os.ReadFile(pending)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(string(data)).To(Equal("boot-id:boot-a\n"))
+			}).Return(command.Result{ExitCode: command.SignalExitCode, Signal: syscall.SIGTERM}, nil).Once()
+			status, err := runInterrupt(ctx, req, runtime, layout, interrupts.NodeRestart{})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(status).To(Equal(execution.StatusSuccess))
+			Expect(marker).NotTo(BeAnExistingFile())
+		},
+		Entry("missing prefix", "old timestamp"),
+		Entry("empty boot ID", "boot-id:\n"),
+	)
+
+	It("resumes service commands after the last persisted success", func() {
+		value := interrupts.ServiceRestart{Services: []string{"a", "b"}}
+		markers := interruptCompletionMarkers(layout, runtime.resourceID, value)
+		runner.EXPECT().Run(ctx, expectedCommand("systemctl", "daemon-reload")).Run(func(context.Context, command.Command) {
+			Expect(markers[0]).NotTo(BeAnExistingFile())
+		}).Return(command.Result{}, nil).Once()
+		runner.EXPECT().Run(ctx, expectedCommand("systemctl", "restart", "a")).Run(func(context.Context, command.Command) {
+			Expect(markers[0]).To(BeAnExistingFile())
+			Expect(markers[1]).NotTo(BeAnExistingFile())
+		}).Return(command.Result{ExitCode: 1}, nil).Once()
+		status, err := runInterrupt(ctx, req, runtime, layout, value)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(status).To(Equal(execution.StatusFailed))
+		Expect(markers[1]).NotTo(BeAnExistingFile())
+		Expect(markers[2]).NotTo(BeAnExistingFile())
+
+		runner.EXPECT().Run(ctx, expectedCommand("systemctl", "restart", "a")).Return(command.Result{}, nil).Once()
+		runner.EXPECT().Run(ctx, expectedCommand("systemctl", "restart", "b")).Run(func(context.Context, command.Command) {
+			Expect(markers[1]).To(BeAnExistingFile())
+			Expect(markers[2]).NotTo(BeAnExistingFile())
+		}).Return(command.Result{}, nil).Once()
+		status, err = runInterrupt(ctx, req, runtime, layout, value)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(status).To(Equal(execution.StatusSuccess))
+		for _, marker := range markers {
+			Expect(marker).To(BeAnExistingFile())
+		}
+		runtime.runnerFactory = func(...command.RunnerOption) command.Runner {
+			Fail("completed services constructed a runner")
+			return nil
+		}
+		status, err = runInterrupt(ctx, req, runtime, layout, value)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(status).To(Equal(execution.StatusSuccess))
+	})
+
+	DescribeTable("removes the pending reboot marker if execution cannot begin",
+		func(copyDir, resourceID string, writeLogs bool, expectedError string) {
+			writeBootID("boot-a")
+			req.copyDir, runtime.resourceID, runtime.writeLogs = copyDir, resourceID, writeLogs
+			marker := interruptCompletionMarkers(layout, runtime.resourceID, interrupts.NodeRestart{})[0]
+			pending := filepath.Join(filepath.Dir(marker), "node_restart_0.pending")
+			runtime.runnerFactory = func(...command.RunnerOption) command.Runner {
+				Fail("invalid execution setup constructed a runner")
+				return nil
+			}
+			status, err := runInterrupt(ctx, req, runtime, layout, interrupts.NodeRestart{})
+			Expect(status).To(Equal(execution.StatusFailed))
+			Expect(err).To(MatchError(ContainSubstring(expectedError)))
+			Expect(pending).NotTo(BeAnExistingFile())
+			Expect(marker).NotTo(BeAnExistingFile())
+		},
+		Entry("relative package path", "relative", "resource_package_1.0.0", false, "configuring interrupt"),
+		Entry("invalid log identity", "/package", "invalid", true, "resolving interrupt log identity"),
+	)
+
+	DescribeTable("does not attempt reboot without a valid host boot ID",
+		func(missing bool) {
+			if !missing {
+				writeBootID("")
+			}
+			runtime.runnerFactory = func(...command.RunnerOption) command.Runner {
+				Fail("invalid boot ID constructed a runner")
+				return nil
+			}
+			status, err := runInterrupt(ctx, req, runtime, layout, interrupts.NodeRestart{})
+			Expect(status).To(Equal(execution.StatusFailed))
+			Expect(err).To(MatchError(ContainSubstring("reading host boot ID")))
+			marker := interruptCompletionMarkers(layout, runtime.resourceID, interrupts.NodeRestart{})[0]
+			Expect(marker).NotTo(BeAnExistingFile())
+			Expect(filepath.Join(filepath.Dir(marker), "node_restart_0.pending")).NotTo(BeAnExistingFile())
+		},
+		Entry("missing boot ID", true),
+		Entry("empty boot ID", false),
+	)
+
+	It("reports a conflicting completion path without starting service commands", func() {
+		value := interrupts.ServiceRestart{Services: []string{"a"}}
+		marker := interruptCompletionMarkers(layout, runtime.resourceID, value)[0]
+		Expect(os.MkdirAll(marker, 0o755)).To(Succeed())
+		runtime.runnerFactory = func(...command.RunnerOption) command.Runner {
+			Fail("invalid completion marker constructed a runner")
+			return nil
+		}
+		status, err := runInterrupt(ctx, req, runtime, layout, value)
+		Expect(status).To(Equal(execution.StatusFailed))
+		Expect(err).To(MatchError(ContainSubstring("checking interrupt completion marker")))
+	})
+
+	It("stops service execution when a completion marker cannot be persisted", func() {
+		value := interrupts.ServiceRestart{Services: []string{"a", "b"}}
+		markers := interruptCompletionMarkers(layout, runtime.resourceID, value)
+		runner.EXPECT().Run(ctx, expectedCommand("systemctl", "daemon-reload")).Run(func(context.Context, command.Command) {
+			Expect(os.MkdirAll(markers[0], 0o755)).To(Succeed())
+		}).Return(command.Result{}, nil).Once()
+		status, err := runInterrupt(ctx, req, runtime, layout, value)
+		Expect(status).To(Equal(execution.StatusFailed))
+		Expect(err).To(MatchError(ContainSubstring("command 0 complete")))
+		Expect(markers[1]).NotTo(BeAnExistingFile())
+		Expect(markers[2]).NotTo(BeAnExistingFile())
+	})
+
+	It("rejects an invalid interrupt payload before constructing a runner", func() {
+		req.interruptData = "invalid-base64"
+		runtime.runnerFactory = func(...command.RunnerOption) command.Runner {
+			Fail("invalid interrupt payload constructed a runner")
+			return nil
+		}
+		status, err := runDecodedInterrupt(ctx, req, runtime, layout)
+		Expect(status).To(Equal(execution.StatusFailed))
+		Expect(err).To(MatchError(ContainSubstring("decoding interrupt")))
 	})
 })

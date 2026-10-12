@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/NVIDIA/nodewright/agent/internal/command"
+	commandmock "github.com/NVIDIA/nodewright/agent/internal/command/mock"
 	"github.com/NVIDIA/nodewright/agent/internal/execution"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -81,5 +82,47 @@ var _ = Describe("NodeRestart", func() {
 		err := waitForNodeRestart(ctx, time.Hour)
 
 		Expect(errors.Is(err, context.Canceled)).To(BeTrue())
+	})
+})
+
+var _ = Describe("NodeRestart command execution", func() {
+	DescribeTable("interprets the reboot command result",
+		func(result command.Result, runErr error, expected execution.Status) {
+			runner := commandmock.NewMockRunner(GinkgoT())
+			config := newInterruptRunConfig(withInterruptRunner(runner))
+			ctx := context.Background()
+			runner.EXPECT().Run(ctx, interruptCommand(config, "reboot")).Return(result, runErr).Once()
+
+			status, err := (NodeRestart{}).Run(ctx, config)
+			Expect(status).To(Equal(expected))
+			if runErr != nil {
+				Expect(errors.Is(err, runErr)).To(BeTrue())
+				Expect(err.Error()).To(ContainSubstring(`command "reboot"`))
+			} else {
+				Expect(err).NotTo(HaveOccurred())
+			}
+		},
+		Entry("SIGTERM confirms shutdown", command.Result{ExitCode: command.SignalExitCode, Signal: syscall.SIGTERM}, nil, execution.StatusSuccess),
+		Entry("SIGKILL does not confirm shutdown", command.Result{ExitCode: command.SignalExitCode, Signal: syscall.SIGKILL}, nil, execution.StatusFailed),
+		Entry("non-zero exit fails", command.Result{ExitCode: 2}, nil, execution.StatusFailed),
+		Entry("runner errors are preserved", command.Result{}, errors.New("reboot unavailable"), execution.StatusFailed),
+		Entry("SIGTERM with a runner error still fails", command.Result{ExitCode: command.SignalExitCode, Signal: syscall.SIGTERM}, errors.New("interrupted runner"), execution.StatusFailed),
+	)
+
+	It("waits for confirmation after exit zero and honours cancellation", func() {
+		runner := commandmock.NewMockRunner(GinkgoT())
+		config := newInterruptRunConfig(withInterruptRunner(runner))
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		runner.EXPECT().Run(ctx, interruptCommand(config, "reboot")).
+			RunAndReturn(func(context.Context, command.Command) (command.Result, error) {
+				cancel()
+				return command.Result{ExitCode: command.SuccessExitCode}, nil
+			}).Once()
+
+		status, err := (NodeRestart{}).Run(ctx, config)
+		Expect(status).To(Equal(execution.StatusFailed))
+		Expect(errors.Is(err, context.Canceled)).To(BeTrue())
+		Expect(err.Error()).To(ContainSubstring("waiting for host restart"))
 	})
 })

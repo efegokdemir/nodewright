@@ -28,6 +28,7 @@ import (
 	"path/filepath"
 
 	"github.com/NVIDIA/nodewright/agent/internal/command"
+	commandmock "github.com/NVIDIA/nodewright/agent/internal/command/mock"
 	"github.com/NVIDIA/nodewright/agent/internal/config"
 	"github.com/NVIDIA/nodewright/agent/internal/execution"
 	"github.com/NVIDIA/nodewright/agent/internal/flags"
@@ -103,6 +104,28 @@ var _ = Describe("step orchestration", func() {
 		flagStore, err = flags.NewStore(layout, cfg)
 		Expect(err).NotTo(HaveOccurred())
 		historyStore = historymock.NewMockStore(GinkgoT())
+	})
+
+	It("passes the runner factory to a concrete step and marks it only after execution", func() {
+		runner := commandmock.NewMockRunner(GinkgoT())
+		runtime.runnerFactory = func(options ...command.RunnerOption) command.Runner {
+			Expect(command.NewRunner(options...)).To(Equal(command.NewRunner(command.WithChroot(root))))
+			return runner
+		}
+		ctx := context.Background()
+		marked := false
+		runner.EXPECT().Run(ctx, command.NewCommand("/packages/package/skyhook_dir/run.sh",
+			command.WithWorkingDirectory(req.copyDir),
+			command.WithEnvironment(map[string]string{"STEP_ROOT": "/packages/package/skyhook_dir", "SKYHOOK_DIR": req.copyDir}),
+			command.WithStdout(runtime.stdout), command.WithStderr(runtime.stderr), command.WithRequiredPermissions(0o111),
+		)).Run(func(context.Context, command.Command) { Expect(marked).To(BeFalse()) }).Return(command.Result{}, nil).Once()
+		status, err := runStep(ctx, req, runtime, layout, cfg, step.NewRegularStep("run.sh"), func() error {
+			marked = true
+			return nil
+		})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(status).To(Equal(execution.StatusSuccess))
+		Expect(marked).To(BeTrue())
 	})
 
 	It("writes START and completion flags around successful steps", func() {

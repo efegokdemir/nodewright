@@ -29,6 +29,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+
+	"github.com/NVIDIA/nodewright/agent/internal/command"
 )
 
 // Status reports whether an agent operation satisfied its execution policy.
@@ -41,11 +43,12 @@ const (
 
 // Config contains the filesystem and output composition for an agent operation.
 type Config struct {
-	rootMount  string
-	stepRoot   string
-	skyhookDir string
-	stdout     io.Writer
-	stderr     io.Writer
+	rootMount     string
+	stepRoot      string
+	skyhookDir    string
+	stdout        io.Writer
+	stderr        io.Writer
+	runnerFactory func(...command.RunnerOption) command.Runner
 }
 
 // RootMount returns the absolute host root used by host operations.
@@ -62,6 +65,15 @@ func (config Config) Stdout() io.Writer { return config.stdout }
 
 // Stderr returns the destination for command standard error.
 func (config Config) Stderr() io.Writer { return config.stderr }
+
+// NewRunner constructs a command runner using the configured factory.
+// Without a factory, it preserves the default command runner behaviour.
+func (config Config) NewRunner(options ...command.RunnerOption) command.Runner {
+	if config.runnerFactory != nil {
+		return config.runnerFactory(options...)
+	}
+	return command.NewRunner(options...)
+}
 
 // Validate reports whether the run configuration is complete.
 func (config Config) Validate() error {
@@ -85,6 +97,14 @@ func (config Config) Validate() error {
 
 // Option configures a Config.
 type Option func(*Config)
+
+// WithRunnerFactory replaces command runner construction. A nil factory uses
+// command.NewRunner, as does a configuration without this option.
+func WithRunnerFactory(factory func(...command.RunnerOption) command.Runner) Option {
+	return func(config *Config) {
+		config.runnerFactory = factory
+	}
+}
 
 // NewConfig constructs agent execution policy.
 func NewConfig(options ...Option) (Config, error) {

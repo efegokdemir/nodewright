@@ -37,6 +37,11 @@ through the mounted host root before execution. Operations report
 `execution.StatusSuccess` means the operation satisfied its execution policy,
 while `execution.StatusFailed` means it did not.
 
+`execution.WithRunnerFactory` lets tests substitute command execution while
+exercising the concrete step and interrupt implementations. `Config.NewRunner`
+forwards the requested runner options to that factory; without an override it
+uses `command.NewRunner`, including the existing host chroot behaviour.
+
 The agent reserves `STEP_ROOT` and `SKYHOOK_DIR` for every step and
 `PREVIOUS_VERSION` and `CURRENT_VERSION` for upgrade steps. Runtime values
 overwrite matching keys from a package's configured `env`. For host steps,

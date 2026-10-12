@@ -19,11 +19,13 @@
 package step
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
 
 	"github.com/NVIDIA/nodewright/agent/internal/command"
+	commandmock "github.com/NVIDIA/nodewright/agent/internal/command/mock"
 	"github.com/NVIDIA/nodewright/agent/internal/execution"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -136,5 +138,92 @@ var _ = Describe("shared step behavior", func() {
 
 		Expect(err).NotTo(HaveOccurred())
 		Expect(status).To(Equal(execution.StatusSuccess))
+	})
+})
+
+var _ = Describe("step runner selection", func() {
+	DescribeTable("uses the appropriate runner and paths",
+		func(onHost bool) {
+			root := GinkgoT().TempDir()
+			hostRunner := commandmock.NewMockRunner(GinkgoT())
+			plainRunner := commandmock.NewMockRunner(GinkgoT())
+			stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
+			chrootCalls, plainCalls := 0, 0
+			config, err := execution.NewConfig(execution.WithRootMount(root), execution.WithStepRoot("/steps"),
+				execution.WithSkyhookDir("/package"), execution.WithRunOutput(stdout, stderr),
+				execution.WithRunnerFactory(func(options ...command.RunnerOption) command.Runner {
+					if len(options) == 0 {
+						plainCalls++
+						return plainRunner
+					}
+					Expect(command.NewRunner(options...)).To(Equal(command.NewRunner(command.WithChroot(root))))
+					chrootCalls++
+					return hostRunner
+				}),
+			)
+			Expect(err).NotTo(HaveOccurred())
+			stepRoot, packageDir, runner := "/steps", "/package", hostRunner
+			if !onHost {
+				stepRoot, packageDir, runner = filepath.Join(root, "steps"), filepath.Join(root, "package"), plainRunner
+			}
+			ctx := context.Background()
+			runner.EXPECT().Run(ctx, command.NewCommand(filepath.Join(stepRoot, "run.sh"),
+				command.WithArguments("arg"), command.WithWorkingDirectory(packageDir),
+				command.WithEnvironment(map[string]string{"KEY": "value", "STEP_ROOT": stepRoot, "SKYHOOK_DIR": packageDir}),
+				command.WithStdout(stdout), command.WithStderr(stderr), command.WithRequiredPermissions(0o111),
+			)).Return(command.Result{}, nil).Once()
+			value := NewRegularStep("run.sh", WithOnHost(onHost), WithArguments([]string{"arg"}), WithEnv(map[string]string{"KEY": "value"}))
+			status, err := value.Run(ctx, config)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(status).To(Equal(execution.StatusSuccess))
+			Expect(chrootCalls).To(Equal(1))
+			if onHost {
+				Expect(plainCalls).To(BeZero())
+			} else {
+				Expect(plainCalls).To(Equal(1))
+			}
+		},
+		Entry("host step", true),
+		Entry("container step", false),
+	)
+})
+
+var _ = Describe("step fingerprint stability", func() {
+	It("preserves the on-disk digest and ignores map insertion order and display metadata", func() {
+		value := NewRegularStep("step.sh", WithArguments([]string{"one", "two"}), WithReturncodes([]command.ExitCode{0, 2}),
+			WithEnv(map[string]string{"Z": "last", "A": "first"}), WithOnHost(true))
+		fingerprint, err := value.Fingerprint()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(fingerprint).To(Equal("78890f1ac2fcfde8b35c68a06e0f3cb7d94746d2934ef553fcac703dda87fa0f"))
+		value.Env = map[string]string{"A": "first", "Z": "last"}
+		value.Name, value.IdempotenceMode, value.RequiresInterrupt = "renamed", Disabled, true
+		reordered, err := value.Fingerprint()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(reordered).To(Equal(fingerprint))
+	})
+
+	DescribeTable("changes when execution inputs change",
+		func(option Option) {
+			original, err := NewRegularStep("step.sh").Fingerprint()
+			Expect(err).NotTo(HaveOccurred())
+			changed, err := NewRegularStep("step.sh", option).Fingerprint()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(changed).NotTo(Equal(original))
+		},
+		Entry("arguments", WithArguments([]string{"arg"})),
+		Entry("return codes", WithReturncodes([]command.ExitCode{2})),
+		Entry("environment", WithEnv(map[string]string{"KEY": "value"})),
+		Entry("execution root", WithOnHost(false)),
+	)
+
+	It("shares the same digest between regular and upgrade steps with identical execution inputs", func() {
+		regular := NewRegularStep("upgrade.sh")
+		upgrade, err := NewUpgradeStep("upgrade.sh")
+		Expect(err).NotTo(HaveOccurred())
+		regularFingerprint, err := regular.Fingerprint()
+		Expect(err).NotTo(HaveOccurred())
+		upgradeFingerprint, err := upgrade.Fingerprint()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(upgradeFingerprint).To(Equal(regularFingerprint))
 	})
 })
