@@ -268,7 +268,8 @@ CHAINSAW_ARGS:=--exec-timeout 30s --parallel 1
 POOL_NON_DEFAULT := interrupt uninstall lifecycle
 POOL_NOTIN_SELECTOR := pool notin ($(shell echo $(POOL_NON_DEFAULT) | tr ' ' ','))
 
-e2e-tests: chainsaw install run build-cli ensure-test-symlinks prepare-metrics-test-access ## Run end to end tests. Set POOL=<name> to run a single pool; unset runs all.
+e2e-tests: chainsaw install build-cli ensure-test-symlinks prepare-metrics-test-access ## Run end to end tests. Set POOL=<name> to run a single pool; unset runs all.
+	$(MAKE) run
 	## requires a cluster to be running with access
 	## locally use kind to create clusters
 	## in ci, the plan current is to have a real cluster, and create a node pool for testing
@@ -282,7 +283,8 @@ endif
 	$(MAKE) kill
 	go tool covdata textfmt -i=$(REPORTING)/int -o reporting/int.coverprofile
 
-cli-e2e-tests: chainsaw install run build-cli-with-coverage ensure-test-symlinks ## Run CLI end to end tests with coverage.
+cli-e2e-tests: chainsaw install build-cli-with-coverage ensure-test-symlinks ## Run CLI end to end tests with coverage.
+	$(MAKE) run
 	## Tests the kubectl-nodewright CLI commands against a real cluster
 	## Requires nodes labeled with skyhook.nvidia.com/test-node=skyhooke2e
 	@mkdir -p $(REPORTING)/cli-cover
