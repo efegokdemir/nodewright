@@ -186,6 +186,7 @@ $(REPORTING):
 
 CTLPTL_CONFIG_TEMPLATE ?= config/local-dev/ctlptl-config.yaml
 CTLPTL_CONFIG_RENDERED ?= $(REPORTING)/ctlptl-config.yaml
+CHART_VALUES ?= ../chart/values.yaml
 
 .PHONY: print-k8s-test-versions-github-output
 print-k8s-test-versions-github-output: ## Print Kubernetes test versions in GitHub Actions output format.
@@ -195,7 +196,26 @@ print-k8s-test-versions-github-output: ## Print Kubernetes test versions in GitH
 .PHONY: print-chart-agent-image
 print-chart-agent-image: ## Print the agent image chart/values.yaml pins, for AGENT_IMAGE.
 	@$(MAKE) --no-print-directory yq >/dev/null
-	@echo "$$($(YQ) -r '.controllerManager.manager.agent.repository' ../chart/values.yaml):$$($(YQ) -r '.controllerManager.manager.agent.tag' ../chart/values.yaml)"
+	@set -e; \
+	repository="$$($(YQ) -r '.controllerManager.manager.agent.repository // ""' "$(CHART_VALUES)")"; \
+	tag="$$($(YQ) -r '.controllerManager.manager.agent.tag // ""' "$(CHART_VALUES)")"; \
+	digest="$$($(YQ) -r '.controllerManager.manager.agent.digest // ""' "$(CHART_VALUES)")"; \
+	if [ -z "$$repository" ] || [ "$$repository" = "null" ]; then \
+		echo "print-chart-agent-image: agent repository is missing from $(CHART_VALUES)" >&2; \
+		exit 1; \
+	fi; \
+	if [ -z "$$tag" ] && [ -z "$$digest" ]; then \
+		echo "print-chart-agent-image: agent tag and digest are both missing from $(CHART_VALUES)" >&2; \
+		exit 1; \
+	fi; \
+	printf '%s' "$$repository"; \
+	if [ -n "$$tag" ]; then printf ':%s' "$$tag"; fi; \
+	if [ -n "$$digest" ]; then printf '@%s' "$$digest"; fi; \
+	printf '\n'
+
+.PHONY: test-print-chart-agent-image
+test-print-chart-agent-image: yq ## Test the chart agent image reference helper.
+	@YQ="$(YQ)" bash ./test-print-chart-agent-image.sh
 
 ## Docker Hub resets connections often enough that an unretried inspect fails CI
 ## with "not published" for an image that is published. RETRY only wraps reads.
@@ -246,7 +266,7 @@ watch-tests: ## watch unit tests and auto run on changes.
 	$(GINKGO) watch $(GOFLAGS) -p -vv ./...
 
 .PHONY: unit-test
-unit-tests: reporting manifests generate envtest ginkgo kill ## Run unit tests.
+unit-tests: test-print-chart-agent-image reporting manifests generate envtest ginkgo kill ## Run unit tests.
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" $(GINKGO) $(GOFLAGS) --cover --coverprofile=unit.coverprofile --output-dir=$(REPORTING) -vv --trace --junit-report=$(REPORTING)/unit.xml --keep-going --timeout=180s ./...
 
 ## exec time is for things like scripts and commands, if we new more of these, might want to switch to a config file
@@ -381,9 +401,13 @@ check-agent-image: ## Fail fast if AGENT_IMAGE is unset or malformed.
 	esac; \
 	img="$(AGENT_IMAGE)"; \
 	case "$${img##*/}" in \
+		*:|*@) \
+			echo "Error: AGENT_IMAGE has an empty tag or digest: '$(AGENT_IMAGE)'"; \
+			exit 1 ;; \
 		*:*) ;; \
+		*@?*) ;; \
 		*) \
-			echo "Error: AGENT_IMAGE has no tag: '$(AGENT_IMAGE)'"; \
+			echo "Error: AGENT_IMAGE has no tag or digest: '$(AGENT_IMAGE)'"; \
 			echo "It must be a full reference, repository:tag or repository@digest -- an untagged"; \
 			echo "reference resolves to :latest, which is not what the chart pins and not what CI tests."; \
 			exit 1 ;; \
