@@ -638,13 +638,13 @@ These are the same checks `.github/actions/cosign-verify-release` runs against e
 
 ## Vulnerability Scanning
 
-The `Image Vulnerability Scan` workflow (`.github/workflows/vuln-scan-images.yaml`) runs [Grype](https://github.com/anchore/grype) against the published container images on a weekly cron, Thursday 09:00 UTC, plus `workflow_dispatch`.
+The `Image Vulnerability Scan` workflow (`.github/workflows/vuln-scan-images.yaml`) runs [Grype](https://github.com/anchore/grype) against published container images nightly at 09:00 UTC, plus `workflow_dispatch`.
 
-It scans two images, both by their moving `latest` tag: `ghcr.io/nvidia/nodewright/operator:latest` and `ghcr.io/nvidia/nodewright/agent:latest`. Not every released version, only whatever `latest` currently points at.
+It continues to scan the moving `latest` tags and also resolves the newest successful main image build for each component. The main scan uses the immutable commit-SHA tag, so the agent image is still found when its workflow did not rebuild on the latest repository commit. If a component's newest prerelease tag is newer than its latest stable tag, that image is scanned too.
 
-Findings are uploaded as SARIF and show up as GitHub code scanning alerts in the repository Security tab, under the categories `grype-operator` and `grype-agent`. One category per image is required, not cosmetic: uploads sharing a category replace one another. Alerts dedupe across runs and close themselves once a later run stops reporting them.
+Findings are uploaded as SARIF and show up as GitHub code scanning alerts in the repository Security tab. Released, main-built and prerelease images use separate categories (`grype-operator`, `grype-operator-main`, `grype-operator-prerelease`, and the corresponding agent categories) so one stream cannot replace or close another. `govulncheck` also scans the main operator and agent source modules nightly and uploads reachable Go vulnerability findings under `govulncheck-operator` and `govulncheck-agent`.
 
-**The scan never fails a build.** No part of the release path is gated on a finding today; gating is deferred to #630.
+Vulnerability findings do not fail the workflow or gate a release. Release gating is deferred to #630.
 
 Run it on demand rather than waiting for Thursday:
 
