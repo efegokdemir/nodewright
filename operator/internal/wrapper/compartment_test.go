@@ -381,8 +381,7 @@ var _ = Describe("Compartment", func() {
 
 		It("should not run sticky nodes past the budget while others are InProgress", func() {
 			// node-1 freed its slot while ignored or untolerated and node-2 took it. node-1 is
-			// eligible again but waits for node-2 rather than running over the budget of 1. The cap
-			// holds only while node-2 is InProgress; once no node is, every sticky node runs.
+			// eligible again but waits for node-2 rather than running over the budget of 1.
 			skyhook.Status.NodePriority = map[string]metav1.Time{
 				"node-1": metav1.Now(),
 				"node-2": metav1.Now(),
@@ -400,6 +399,81 @@ var _ = Describe("Compartment", func() {
 			}
 
 			Expect(compartment.GetNodesForNextBatch(nil)).To(ConsistOf(compartment.Nodes[1]))
+		})
+
+		It("should cap sticky-only batches and prefer non-erroring nodes", func() {
+			skyhook.Status.NodePriority = map[string]metav1.Time{
+				"node-erroring": metav1.Now(),
+				"node-waiting":  metav1.Now(),
+			}
+
+			compartment := &wrapper.Compartment{
+				Compartment: v1alpha1.Compartment{
+					Budget: v1alpha1.DeploymentBudget{Count: ptr.To(1)},
+				},
+				BatchState: v1alpha1.BatchProcessingState{CurrentBatch: 1},
+				Nodes: []wrapper.SkyhookNode{
+					newMockNode(GinkgoT(), "node-erroring", v1alpha1.StatusErroring, false, skyhook),
+					newMockNode(GinkgoT(), "node-waiting", v1alpha1.StatusWaiting, false, skyhook),
+				},
+			}
+
+			result := compartment.GetNodesForNextBatch(nil)
+			Expect(result).To(ConsistOf(compartment.Nodes[1]))
+			// Capping selection must not discard the other sticky member.
+			Expect(skyhook.Status.NodePriority).To(HaveLen(2))
+		})
+
+		It("should prefer sticky nodes that are mid-interrupt when capping", func() {
+			pkg := v1alpha1.Package{PackageRef: v1alpha1.PackageRef{Name: "pkg"}}
+			skyhook.NodeWright.Spec.Packages = v1alpha1.Packages{"pkg": pkg}
+			skyhook.Status.NodePriority = map[string]metav1.Time{
+				"node-waiting":        metav1.Now(),
+				"node-post-interrupt": metav1.Now(),
+			}
+
+			waiting := newMockNode(GinkgoT(), "node-waiting", v1alpha1.StatusWaiting, false, skyhook)
+			postInterrupt := newMockNode(GinkgoT(), "node-post-interrupt", v1alpha1.StatusWaiting, false, skyhook)
+			stage := v1alpha1.StagePostInterrupt
+			waiting.EXPECT().NextStage(&pkg).Return(nil).Maybe()
+			postInterrupt.EXPECT().NextStage(&pkg).Return(&stage).Maybe()
+
+			compartment := &wrapper.Compartment{
+				Compartment: v1alpha1.Compartment{
+					Budget: v1alpha1.DeploymentBudget{Count: ptr.To(1)},
+				},
+				BatchState: v1alpha1.BatchProcessingState{CurrentBatch: 1},
+				Nodes:      []wrapper.SkyhookNode{waiting, postInterrupt},
+			}
+
+			Expect(compartment.GetNodesForNextBatch(nil)).To(ConsistOf(postInterrupt))
+		})
+
+		It("should prefer cordoned sticky nodes when capping", func() {
+			skyhook.Status.NodePriority = map[string]metav1.Time{
+				"node-waiting":  metav1.Now(),
+				"node-cordoned": metav1.Now(),
+			}
+
+			waiting := newMockNode(GinkgoT(), "node-waiting", v1alpha1.StatusWaiting, false, skyhook)
+			cordoned := mockwrapper.NewMockSkyhookNode(GinkgoT())
+			cordoned.EXPECT().GetNode().Return(&corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{Name: "node-cordoned"},
+				Spec:       corev1.NodeSpec{Unschedulable: true},
+			}).Maybe()
+			cordoned.EXPECT().GetSkyhook().Return(skyhook).Maybe()
+			cordoned.EXPECT().Status().Return(v1alpha1.StatusWaiting).Maybe()
+			cordoned.EXPECT().IsComplete().Return(false).Maybe()
+
+			compartment := &wrapper.Compartment{
+				Compartment: v1alpha1.Compartment{
+					Budget: v1alpha1.DeploymentBudget{Count: ptr.To(1)},
+				},
+				BatchState: v1alpha1.BatchProcessingState{CurrentBatch: 1},
+				Nodes:      []wrapper.SkyhookNode{waiting, cordoned},
+			}
+
+			Expect(compartment.GetNodesForNextBatch(nil)).To(ConsistOf(cordoned))
 		})
 
 		It("should fall through to new batch when NodePriority is nil", func() {
@@ -441,8 +515,7 @@ var _ = Describe("Compartment", func() {
 			result := compartment.GetNodesForNextBatch(nil)
 			// Both sticky nodes returned
 			Expect(result).To(HaveLen(2))
-			names := []string{result[0].GetNode().Name, result[1].GetNode().Name}
-			Expect(names).To(ConsistOf("node-1", "node-2"))
+			Expect(result).To(Equal([]wrapper.SkyhookNode{compartment.Nodes[0], compartment.Nodes[1]}))
 		})
 
 		It("should not include non-sticky nodes in the sticky batch", func() {

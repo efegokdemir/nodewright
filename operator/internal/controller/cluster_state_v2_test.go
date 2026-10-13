@@ -978,8 +978,9 @@ var _ = Describe("NodePicker ignored batch nodes", func() {
 			condition := findSkyhookStatusCondition(state.GetSkyhook().Status.Conditions, wrapper.SkyhookConditionTaintNotTolerable)
 			Expect(condition.Status).To(Equal(metav1.ConditionTrue))
 			ignored.GetNode().Spec.Taints = nil
-			_, waiting := state.GetNode("waiting")
-			Expect(NewNodePicker(testLogger, nil).SelectNodes(state)).To(ConsistOf(ignored, waiting))
+			resumed := NewNodePicker(testLogger, nil).SelectNodes(state)
+			Expect(resumed).To(ConsistOf(ignored))
+			Expect(state.GetSkyhook().Status.NodePriority).To(HaveKey("waiting"))
 		},
 		Entry("when blocked", v1alpha1.StatusBlocked),
 		Entry("between packages", v1alpha1.StatusWaiting),

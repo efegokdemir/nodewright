@@ -19,6 +19,8 @@
 package wrapper
 
 import (
+	"sort"
+
 	"github.com/NVIDIA/nodewright/operator/api/nodewright/v1alpha1"
 )
 
@@ -118,17 +120,44 @@ func (c *Compartment) GetNodesForNextBatch(eligible func(SkyhookNode) bool) []Sk
 	// and it would otherwise stall until every other node went idle. While any node is
 	// InProgress they are capped at the batch size: a node that was ignored, untolerated or
 	// relabelled in keeps its NodePriority entry while another takes its slot, so entries can
-	// outnumber the budget. Once none is, every sticky node runs, uncapped.
+	// outnumber the budget. Apply the same cap when resuming a sticky-only batch.
 	inProgress, sticky := c.currentBatchNodes(eligible)
 	if len(inProgress) > 0 {
 		room := max(0, c.batchSize()-len(inProgress))
 		return append(inProgress, sticky[:min(room, len(sticky))]...)
 	}
 	if len(sticky) > 0 {
+		capacity := max(0, c.batchSize())
+		if len(sticky) > capacity {
+			sort.SliceStable(sticky, func(i, j int) bool {
+				return stickyNodePriority(sticky[i]) < stickyNodePriority(sticky[j])
+			})
+			return sticky[:capacity]
+		}
 		return sticky
 	}
 
 	return c.createNewBatch(eligible)
+}
+
+// stickyNodePriority lets nodes that can make progress keep a slot when stale sticky membership
+// exceeds the batch capacity. Erroring nodes are deprioritized because they may not retry; nodes
+// that are cordoned or mid-interrupt are prioritised so their existing work can resume.
+func stickyNodePriority(node SkyhookNode) int {
+	if node.Status() == v1alpha1.StatusErroring {
+		return 2
+	}
+	if node.GetNode().Spec.Unschedulable {
+		return 0
+	}
+	if skyhook := node.GetSkyhook(); skyhook != nil && skyhook.NodeWright != nil {
+		for _, pkg := range skyhook.Spec.Packages {
+			if stage := node.NextStage(&pkg); stage != nil && *stage == v1alpha1.StagePostInterrupt {
+				return 0
+			}
+		}
+	}
+	return 1
 }
 
 // currentBatchNodes splits the eligible nodes of the batch in flight into the InProgress ones and
