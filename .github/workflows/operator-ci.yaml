@@ -22,6 +22,7 @@ on:
   pull_request:
     paths:
       - operator/**/*.go
+      - operator/Makefile
       - operator/go.mod
       - operator/go.sum
       - operator/deps.mk
@@ -34,6 +35,7 @@ on:
       - .github/workflows/operator-ci.yaml
       - k8s-tests/**
       - chart/**
+      - Makefile
   push:
     branches:
       - main
@@ -41,6 +43,7 @@ on:
       - operator/*
     paths:
       - operator/**/*.go
+      - operator/Makefile
       - operator/go.mod
       - operator/go.sum
       - operator/deps.mk
@@ -53,6 +56,7 @@ on:
       - .github/workflows/operator-ci.yaml
       - k8s-tests/**
       - chart/**
+      - Makefile
 
 permissions:
   contents: read
