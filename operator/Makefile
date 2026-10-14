@@ -648,6 +648,11 @@ run: manifests generate reporting install kill ## Run a controller from your hos
 else
 run: manifests generate fmt vet lint reporting install kill ## Run a controller from your host.
 endif
+ifneq ($(strip $(AGENT_IMAGE)),)
+ifeq ($(origin RUN_AGENT_IMAGE),file)
+	@echo "Warning: AGENT_IMAGE is set, but make run uses the default RUN_AGENT_IMAGE=$(RUN_AGENT_IMAGE). Set RUN_AGENT_IMAGE explicitly to use a different image." >&2
+endif
+endif
 	mkdir -p $(REPORTING)/int
 	rm -rf $(REPORTING)/int/*
 	go build $(GOFLAGS) -cover $(GO_LDFLAGS) -o $(LOCALBIN)/manager cmd/manager/main.go
