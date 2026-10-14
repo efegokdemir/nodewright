@@ -80,7 +80,7 @@ var _ = Describe("Jobs execution swap", func() {
 		Expect(batchv1.AddToScheme(scheme)).To(Succeed())
 		Expect(v1alpha1.AddToScheme(scheme)).To(Succeed())
 
-		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).WithStatusSubresource(&v1alpha1.NodeWright{}).
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).WithStatusSubresource(&v1alpha1.NodeWright{}, &batchv1.Job{}).
 			WithIndex(&corev1.Pod{}, fieldSelectorNodeName, func(obj client.Object) []string {
 				pod, ok := obj.(*corev1.Pod)
 				if !ok {
@@ -154,6 +154,82 @@ var _ = Describe("Jobs execution swap", func() {
 		var pods corev1.PodList
 		Expect(c.List(ctx, &pods, client.InNamespace(namespace))).To(Succeed())
 		Expect(pods.Items).To(BeEmpty())
+	})
+
+	It("carries an existing Job's failed attempts into an in-progress node state", func() {
+		node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: nodeName}}
+		scr := &v1alpha1.NodeWright{
+			ObjectMeta: metav1.ObjectMeta{Name: skyhookName, Namespace: namespace, Generation: 1},
+			Spec:       v1alpha1.NodeWrightSpec{Packages: v1alpha1.Packages{"tuning": *pkg}},
+		}
+		r, c := newReconciler(node, scr)
+		skyhookNode, err := wrapper.NewSkyhookNode(node, scr)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(r.ApplyPackage(ctx, GinkgoLogr, nil, skyhookNode, pkg, false)).To(Succeed())
+
+		var jobs batchv1.JobList
+		Expect(c.List(ctx, &jobs, client.InNamespace(namespace))).To(Succeed())
+		Expect(jobs.Items).To(HaveLen(1))
+		job := jobs.Items[0]
+		job.Status.Failed = 1
+		Expect(c.Status().Update(ctx, &job)).To(Succeed())
+
+		jobReconciler := NewJobReconciler(c, c, k8sfake.NewClientset(), events.NewFakeRecorder(50), validOpts().JobOperatorOptions)
+		result, err := jobReconciler.JobReconcile(ctx, &job)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(result.RequeueAfter).To(Equal(2 * time.Second))
+
+		// The first Job event races ahead of the heavy pass's deferred node-state save.
+		var beforeSave corev1.Node
+		Expect(c.Get(ctx, types.NamespacedName{Name: nodeName}, &beforeSave)).To(Succeed())
+		beforeState, err := wrapper.NewSkyhookNodeOnly(&beforeSave, skyhookName)
+		Expect(err).ToNot(HaveOccurred())
+		state, err := beforeState.State()
+		Expect(err).ToNot(HaveOccurred())
+		Expect(state).To(BeEmpty())
+
+		// The heavy pass then persists its in-memory in_progress entry with the stale zero count.
+		Expect(c.Update(ctx, skyhookNode.GetNode())).To(Succeed())
+		var afterSave corev1.Node
+		Expect(c.Get(ctx, types.NamespacedName{Name: nodeName}, &afterSave)).To(Succeed())
+		skyhookNode, err = wrapper.NewSkyhookNode(&afterSave, scr)
+		Expect(err).ToNot(HaveOccurred())
+		afterSaveStatus, found := skyhookNode.PackageStatus(pkg.GetUniqueName())
+		Expect(found).To(BeTrue())
+		Expect(afterSaveStatus.State).To(Equal(v1alpha1.StateInProgress))
+		Expect(afterSaveStatus.Restarts).To(BeZero())
+		Expect(c.List(ctx, &jobs, client.InNamespace(namespace))).To(Succeed())
+		Expect(jobs.Items).To(HaveLen(1))
+		Expect(jobs.Items[0].Status.Failed).To(Equal(int32(1)))
+
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "tuning-attempt", Namespace: namespace},
+			Spec:       corev1.PodSpec{NodeName: nodeName, RestartPolicy: corev1.RestartPolicyNever},
+		}
+		Expect(SetPackages(pod, scr, image, v1alpha1.StageApply, pkg)).To(Succeed())
+		podReconciler := NewPodReconciler(c, c, k8sfake.NewClientset(), events.NewFakeRecorder(50), namespace)
+		Expect(podReconciler.recordPodErroring(ctx, pod, 0)).To(Succeed())
+
+		var erroringNode corev1.Node
+		Expect(c.Get(ctx, types.NamespacedName{Name: nodeName}, &erroringNode)).To(Succeed())
+		skyhookNode, err = wrapper.NewSkyhookNode(&erroringNode, scr)
+		Expect(err).ToNot(HaveOccurred())
+		erroringStatus, found := skyhookNode.PackageStatus(pkg.GetUniqueName())
+		Expect(found).To(BeTrue())
+		Expect(erroringStatus.State).To(Equal(v1alpha1.StateErroring))
+		Expect(erroringStatus.Restarts).To(BeZero())
+
+		_, err = jobReconciler.JobReconcile(ctx, &job)
+		Expect(err).ToNot(HaveOccurred())
+		var reconciledNode corev1.Node
+		Expect(c.Get(ctx, types.NamespacedName{Name: nodeName}, &reconciledNode)).To(Succeed())
+		skyhookNode, err = wrapper.NewSkyhookNode(&reconciledNode, scr)
+		Expect(err).ToNot(HaveOccurred())
+
+		status, found := skyhookNode.PackageStatus(pkg.GetUniqueName())
+		Expect(found).To(BeTrue())
+		Expect(status.State).To(Equal(v1alpha1.StateErroring))
+		Expect(status.Restarts).To(Equal(int32(1)))
 	})
 
 	It("starts one package per node per pass under serial", func() {

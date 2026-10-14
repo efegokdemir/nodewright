@@ -101,6 +101,10 @@ const (
 	// terminal before its stuck stage is treated as erroring evidence: the unreachable-node
 	// case, where the Job controller cannot delete the pod to finalize the failure.
 	failureTargetGrace = 5 * time.Minute
+
+	// jobStateRetryDelay gives the heavy pass time to persist a newly-created stage before
+	// retrying a Job event that arrived ahead of that state write.
+	jobStateRetryDelay = 2 * time.Second
 )
 
 // JobReconciler drives package-stage Jobs on their own watch and workqueue. It is a real
@@ -689,11 +693,15 @@ func (r *JobReconciler) recordJobErroring(ctx context.Context, job *batchv1.Job,
 func (r *JobReconciler) handleActiveJob(ctx context.Context, job *batchv1.Job) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithName("job-reconcile")
 
-	if err := r.recordJobRestarts(ctx, job); err != nil {
+	missingEntry, err := r.recordJobRestarts(ctx, job)
+	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("recording in-flight restarts for job %s: %w", job.Name, err)
 	}
 
 	result := ctrl.Result{}
+	if missingEntry && (job.Status.Failed > 0 || hasJobCondition(job, batchv1.JobFailureTarget)) {
+		result.RequeueAfter = jobStateRetryDelay
+	}
 	if hasJobCondition(job, batchv1.JobFailureTarget) {
 		if err := r.snapshotFailureLogs(ctx, job); err != nil {
 			logger.Error(err, "error snapshotting failure logs", "job", job.Name)
@@ -710,7 +718,10 @@ func (r *JobReconciler) handleActiveJob(ctx context.Context, job *batchv1.Job) (
 			// transition, so schedule the re-check ourselves rather than wait for a resync.
 			// Requeue the time actually left, not a fresh full grace: a Job already part-way
 			// through the window would otherwise wait up to two full windows.
-			result.RequeueAfter = failureTargetRemaining(job)
+			remaining := failureTargetRemaining(job)
+			if result.RequeueAfter == 0 || remaining < result.RequeueAfter {
+				result.RequeueAfter = remaining
+			}
 		}
 	}
 
@@ -726,18 +737,20 @@ func (r *JobReconciler) handleActiveJob(ctx context.Context, job *batchv1.Job) (
 // failed count is the attempt count, and every change to it is a Job event that lands here. An
 // interrupt restarts in place and its entry holds the container's RestartCount, which status.failed
 // does not count, so it is left to the pod watch.
-func (r *JobReconciler) recordJobRestarts(ctx context.Context, job *batchv1.Job) error {
+func (r *JobReconciler) recordJobRestarts(ctx context.Context, job *batchv1.Job) (bool, error) {
 	if isInterruptJob(job) {
-		return nil
+		return false, nil
 	}
 	pkg, err := GetPackage(job)
 	if err != nil {
-		return fmt.Errorf("getting package from job %s: %w", job.Name, err)
+		return false, fmt.Errorf("getting package from job %s: %w", job.Name, err)
 	}
 	if pkg == nil {
-		return nil
+		return false, nil
 	}
-	return patchNodeState(ctx, r.dal, r.uncached, r.Client, jobNodeName(job), func(node *corev1.Node) (bool, error) {
+	missingEntry := false
+	err = patchNodeState(ctx, r.dal, r.uncached, r.Client, jobNodeName(job), func(node *corev1.Node) (bool, error) {
+		missingEntry = false
 		skyhookNode, err := wrapper.NewSkyhookNodeOnly(node, pkg.Skyhook)
 		if err != nil {
 			return false, fmt.Errorf("creating node wrapper for job %s: %w", job.Name, err)
@@ -746,15 +759,20 @@ func (r *JobReconciler) recordJobRestarts(ctx context.Context, job *batchv1.Job)
 		if err != nil {
 			return false, fmt.Errorf("reading node state for job %s: %w", job.Name, err)
 		}
+		status, present := state[pkg.GetUniqueName()]
+		if !present {
+			missingEntry = true
+			return false, nil
+		}
 		if !entryOpenAtStage(state, pkg) {
 			return false, nil
 		}
-		status := state[pkg.GetUniqueName()]
 		if err := skyhookNode.Upsert(pkg.PackageRef, status.Image, status.State, status.Stage, job.Status.Failed, status.ContainerSHA); err != nil {
 			return false, fmt.Errorf("upserting restarts for job %s: %w", job.Name, err)
 		}
 		return skyhookNode.Changed(), nil
 	})
+	return missingEntry, err
 }
 
 // recordStaleFailureTarget records erroring (state only) for a Job stuck at FailureTarget on
